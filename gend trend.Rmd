@@ -1,0 +1,324 @@
+---
+title: “Transfermarkt Database Construction"
+author: "Ibraheem Qurershi BS"
+output: 
+  html_document:
+   theme: paper
+knit: (function(input, ...) {
+    rmarkdown::render(
+      input,
+      output_file = paste0("../reports/", Sys.Date(),"_results",".html"),
+      envir = globalenv()
+    )
+  })
+---
+
+```{r, knittr_setup, include = FALSE}
+knitr::opts_chunk$set(
+    warning = FALSE,
+    message = FALSE,
+    echo = FALSE
+)
+```
+
+```{r setup, include=FALSE}
+if (interactive()) {
+	rm(list = ls())
+}
+
+packages_needed <- c(
+	"RSQLite", "scales", "broom", "httr", "jsonlite",
+	"DescTools", "janitor", "tidyverse",
+	"here", "readxl", "skimr", "visdat", "gender",
+	"stringr", "worldfootballR", "tableone", "emmeans"
+)
+
+invisible(lapply(packages_needed, library, character.only = TRUE))
+
+here()
+
+dataset <- read.csv("backup.csv")
+
+# store backup dataset # write.csv(dataset, "backup.csv")
+
+```
+
+```{r}
+
+base <- "https://api.genderize.io?name="
+# key <- "&apikey=e203d4c449d309c3a4f45ddf34785acb"
+
+ # clean up year
+ for (n in 1:length(dataset$year)) {
+    string <- gsub("\\D", "", dataset$year[n])
+    dataset$year[n] <- as.numeric(substr(string, 1, 4))
+ }
+
+  dataset <- dataset %>% mutate(year = ifelse(is.na(year), 0, year))
+  dataset <- dataset %>% mutate(year = ifelse(year == 2023, 2022, year))
+  dataset <- dataset %>% filter(year != 0)
+ 
+ # clean up authors
+  dataset <- dataset %>% mutate(author = ifelse(author == "", 0, author))
+  dataset <- dataset %>% filter(author != 0)
+  
+  breaky <- 0
+
+  dataset$firstfemale <- "No"
+  
+ for (n in 1:length(dataset$author)) {
+   dataset$author[n] <- str_replace_all(dataset$author[n], "[\r\n]" , "")
+   dataset$author[n] <- gsub("-", "", dataset$author[n]) # take out hyphen
+   names <- strsplit(dataset$author[n], split = ",")
+   
+   dataset$total[n] <- length(names[[1]]) # total authors
+   
+   dataset$femaleas[n] <- 0
+   dataset$nuh[n] <- 0
+   dataset$noname[n] <- 0
+   
+   for (x in 1:length(names[[1]]))
+   {
+      first <- strsplit(str_trim(names[[1]][x]), split = " ")
+      
+       if (nchar(first[[1]][1]) == 1 ) # first author name not listed
+      {
+        dataset$noname[n] <- dataset$noname[n] + 1
+        breaky <- 1
+        dataset$nuh[n] <- dataset$nuh[n] + 1 # keeps track of number of na & unknowns
+      }
+      
+      API_URL <- paste0(base, first[[1]][1], key)
+      temp_raw <- GET(API_URL)
+      temp_list <- fromJSON(rawToChar(temp_raw$content), flatten = TRUE)
+     
+      if (is.null(temp_list$gender)) # name came as null
+      {
+        breaky <- 1 # tells if name is na
+        dataset$nuh[n] <- dataset$nuh[n] + 1 # keeps track of number of na & unknowns
+      }
+      else {
+        breaky <- 0
+        
+      if (temp_list$probability > .7 & breaky == 0 & temp_list$gender == "female") # number female authors
+      {
+        dataset$femaleas[n] <- dataset$femaleas[n] + 1
+      }
+      
+      if (temp_list$probability > .7 & breaky == 0 & temp_list$gender == "female" & x == 1) # first female author yes or no
+      {
+        dataset$firstfemale[n] <- "Yes" 
+      }
+      
+       if (temp_list$probability > .7 & breaky == 0 & temp_list$gender == "female" & x == length(names[[1]])) 
+         # last female author
+      {
+        dataset$lastfemale[n] <- "Yes"
+       }
+      else {dataset$lastfemale[n] <- "No"}
+        }
+      
+   }
+   
+   if (dataset$firstfemale[n] == "Yes" & dataset$lastfemale[n] == "Yes") # both female
+      {
+        dataset$both[n] <- "Yes"
+       }
+      else {dataset$both[n] <- "No"}
+   
+   dataset$maleas[n] <- dataset$total[n] - dataset$femaleas[n] # number male authors
+   dataset$fpercent[n] <- (dataset$femaleas[n]/dataset$total[n])*100 # female author percentage
+   
+ }  
+ 
+analysisset <- c(  
+  "firstfemale",
+  "lastfemale",
+  "both",
+  "femaleas",
+  "maleas", # good as long as no nas
+  "fpercent",
+  "nuh",
+  "journal",
+  "year",
+  "total"
+)
+  
+# backup <- dataset
+# dataset <- backup
+
+# dataset <- dataset %>% filter(nuh == 0)
+
+```
+
+#Table 1. Demographics
+```{r}
+CreateTableOne(
+  strata = "lastfemale", 
+  vars = analysisset,
+  data = dataset, 
+  test = TRUE
+) %>% 
+print(quote = TRUE, noSpaces = TRUE)
+```
+
+#Table 1. Journal
+```{r}
+table1 <- CreateTableOne(
+  strata = "journal", 
+  vars = analysisset,
+  data = dataset, 
+  test = TRUE
+) %>% 
+print(quote = TRUE, noSpaces = TRUE)
+```
+
+Table 4. Post Hoc Tests
+
+```{r continous post hoc tukey test}
+
+# List of variables you want to analyze
+variables <- c("maleas", "femaleas", "fpercent", "total")
+
+# Initialize an empty data frame to store results
+combined_results <- data.frame()
+
+# Loop through each variable
+for (variable in variables) {
+  # Perform ANOVA
+  ANOVA <- aov(as.formula(paste(variable, "~ journal")), data = dataset)
+  
+  # Perform Tukey's HSD test
+  tukey_result <- emmeans(ANOVA, ~ journal) %>% pairs()
+  
+  # Create a table with p-values of Tukey post-hoc comparisons
+  contposthoc <- tukey_result %>%
+    as.data.frame() %>%
+    rownames_to_column("Comparisons") %>%
+    select("contrast", "p.value") %>%
+    t() %>% as.data.frame() %>% row_to_names(1) %>%
+    mutate(Variable = paste0("\"", variable, " (mean (SD))\"")) %>%
+    select(Variable, everything()) %>%
+    tibble()
+  
+  # Combine results
+  combined_results <- bind_rows(combined_results, contposthoc)
+}
+
+# Join table to the main Table 1
+table1 <- print(table1) %>%
+  as.data.frame() %>%
+  rownames_to_column("Variable") %>%
+  tibble() %>%
+  left_join(combined_results, by = "Variable")
+
+print(table1)
+
+```
+
+```{r table4-discrete data table 1}
+
+chisq.post.hoc <- function(tbl, test=c("fisher.test"), popsInRows=TRUE,control=c("fdr","BH","BY","bonferroni","holm","hochberg","hommel"),digits=4) {
+
+ # extract correction method
+ control <- match.arg(control)
+ 
+ # extract which test (fisher or chi square)
+ test <- match.fun(test)
+
+ # test rows or columns
+ if (!popsInRows) tbl <- t(tbl)
+ popsNames <- rownames(tbl)
+
+ # come up with all possible comparisons
+ prs <- combn(1:nrow(tbl),2)
+ 
+ # pre-allocate
+ tests <- ncol(prs)
+ pvals <- numeric(tests)
+ lbls <- character(tests)
+ for (i in 1:tests) {
+ pvals[i] <- test(tbl[prs[,i],])$p.value
+ lbls[i] <- paste(popsNames[prs[,i]],collapse=" vs. ")
+ }
+ adj.pvals <- p.adjust(pvals,method=control)
+ cat("Adjusted p-values used the",control,"method.\n\n")
+
+ data.frame(comparison=lbls,raw.p=round(pvals,digits),adj.p=round(adj.pvals,digits))
+
+}
+```
+
+```{r table4posthoc-fischer test}
+
+# List of variables you want to analyze
+variables <- c("firstfemale", "lastfemale", "both")
+
+# Initialize an empty list to store post-hoc tables
+posthoc_tables <- data.frame()
+
+# Loop through each variable
+for (variable in variables) {
+  # Run chi-square test
+  chisq_result <- chisq.test(dataset[[variable]], dataset$journal)
+  
+  # Make a table with p-values of Fisher post-hoc comparisons
+  posthoc_table <- chisq.post.hoc(xtabs(~journal + dataset[[variable]], data = dataset),
+                                   test = "fisher.test",
+                                   control = "bonferroni") %>%
+    select(comparison, raw.p) %>%
+    t() %>%
+    as.data.frame() %>%
+    row_to_names(1) %>%
+    mutate(Variable = paste0("\"", variable, " = Yes (%)\"")) %>%
+    select(Variable, everything()) %>%
+    tibble()
+  
+  # Store the post-hoc table in the list
+  posthoc_tables <- rbind(posthoc_tables, posthoc_table)
+}
+
+# Join each post-hoc table to the main Table 1
+table1_df <- as.data.frame(table1) %>%
+  rownames_to_column("Variable")
+
+table1_df <- left_join(table1_df, posthoc_tables, by = "Variable")
+table1_df
+
+```
+
+#Table 1. year
+```{r}
+CreateTableOne(
+  strata = "year", 
+  vars = analysisset,
+  data = dataset, 
+  test = TRUE
+) %>% 
+print(quote = TRUE, noSpaces = TRUE)
+```
+
+#Table 2. Regressions
+```{r}
+reg <- function(data, column){
+  print(column)
+  glm(
+    as.factor(get(column)) ~ as.factor(lastfemale) + journal + year,
+    data = data,
+    family = binomial,
+    na.action = na.omit
+  ) %>% 
+  ShowRegTable(digits = 2, quote = FALSE) %>% 
+  as.data.frame() %>% 
+  rownames_to_column("col") %>% 
+  filter(grepl('get', col)) %>% 
+  mutate(col = column)
+}
+
+bind_rows(
+  dataset %>% reg("firstfemale"),
+) %>% rename(
+   "coefci" = "exp(coef) [confint]"
+ )
+
+```
